@@ -24,6 +24,26 @@ cd /home/jetson/isaac_ws
 /usr/bin/python3 demo_ws_control_client.py --host <robot-ip> --port 9001 --path /control
 ```
 
+## PC side GUI client
+
+```bash
+cd /home/jetson/isaac_ws
+/usr/bin/python3 gui_ws_control_client.py --host <robot-ip> --port 9001 --path /control
+```
+
+Hotkeys:
+
+- `1` damp
+- `2` stand up
+- `3` stand down
+- `4` balance stand
+- `5` recovery stand
+- `W/A/S/D` or arrow keys move
+- `Q/E` rotate
+- `Space` stop move
+- `Enter` execute current selected action in list
+- `Esc` quit GUI
+
 ## Notes
 
 - Supported commands: `damp`, `stand_up`, `stand_down`, `move`, `stop_move`, `balance_stand`, `recovery_stand`.
