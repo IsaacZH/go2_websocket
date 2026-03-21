@@ -183,7 +183,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motor-count", type=int, default=12, help="How many motors to publish (Go2 usually 12)")
     parser.add_argument("--lidar-max-points", type=int, default=12000, help="Max point count per lidar frame (downsample if larger)")
     parser.add_argument("--jpeg-quality", type=int, default=80, help="JPEG quality 1-100")
-    parser.add_argument("--name", default="go2-camera-direct", help="Foxglove server name")
+    parser.add_argument("--name", default="go2", help="Foxglove server name")
     return parser.parse_args()
 
 
