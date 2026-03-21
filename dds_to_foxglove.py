@@ -2,11 +2,11 @@ import argparse
 import asyncio
 import base64
 import json
-import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 import cv2
@@ -18,8 +18,9 @@ SDK_REPO_PATH = Path.home() / "unitree_sdk2_python"
 if str(SDK_REPO_PATH) not in sys.path:
     sys.path.insert(0, str(SDK_REPO_PATH))
 
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
 from unitree_sdk2py.go2.video.video_client import VideoClient
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
 
 
 COMPRESSED_IMAGE_SCHEMA = {
@@ -40,6 +41,82 @@ COMPRESSED_IMAGE_SCHEMA = {
     "required": ["timestamp", "frame_id", "format", "data"],
 }
 
+IMU_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "timestamp": {
+            "type": "object",
+            "properties": {
+                "sec": {"type": "integer"},
+                "nsec": {"type": "integer"},
+            },
+            "required": ["sec", "nsec"],
+        },
+        "tick": {"type": "integer"},
+        "quaternion": {"type": "array", "items": {"type": "number"}},
+        "gyroscope": {"type": "array", "items": {"type": "number"}},
+        "accelerometer": {"type": "array", "items": {"type": "number"}},
+        "rpy": {"type": "array", "items": {"type": "number"}},
+        "temperature": {"type": "integer"},
+    },
+    "required": [
+        "timestamp",
+        "tick",
+        "quaternion",
+        "gyroscope",
+        "accelerometer",
+        "rpy",
+        "temperature",
+    ],
+}
+
+MOTOR_STATES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "timestamp": {
+            "type": "object",
+            "properties": {
+                "sec": {"type": "integer"},
+                "nsec": {"type": "integer"},
+            },
+            "required": ["sec", "nsec"],
+        },
+        "tick": {"type": "integer"},
+        "motors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "mode": {"type": "integer"},
+                    "q": {"type": "number"},
+                    "dq": {"type": "number"},
+                    "ddq": {"type": "number"},
+                    "tau_est": {"type": "number"},
+                    "temperature": {"type": "integer"},
+                    "lost": {"type": "integer"},
+                },
+                "required": ["index", "mode", "q", "dq", "ddq", "tau_est", "temperature", "lost"],
+            },
+        },
+    },
+    "required": ["timestamp", "tick", "motors"],
+}
+
+
+class LowStateCache:
+    def __init__(self):
+        self._lock = Lock()
+        self._latest: Optional[LowState_] = None
+
+    def update(self, msg: LowState_) -> None:
+        with self._lock:
+            self._latest = msg
+
+    def get(self) -> Optional[LowState_]:
+        with self._lock:
+            return self._latest
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stream Go2 camera to Foxglove WebSocket without ROS")
@@ -48,8 +125,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bind-host", default=None, help="WebSocket bind IP; default uses --ws-interface IPv4")
     parser.add_argument("--port", type=int, default=8765, help="WebSocket port")
     parser.add_argument("--topic", default="/go2/front_camera/compressed", help="Foxglove topic name")
+    parser.add_argument("--imu-topic", default="/go2/imu", help="Foxglove IMU topic name")
+    parser.add_argument("--motor-topic", default="/go2/motor_states", help="Foxglove motor state topic name")
     parser.add_argument("--frame-id", default="go2_front_camera", help="Frame id in message")
     parser.add_argument("--fps", type=float, default=15.0, help="Publish FPS")
+    parser.add_argument("--state-fps", type=float, default=50.0, help="Publish rate for IMU/motor topics")
+    parser.add_argument("--motor-count", type=int, default=12, help="How many motors to publish (Go2 usually 12)")
     parser.add_argument("--jpeg-quality", type=int, default=80, help="JPEG quality 1-100")
     parser.add_argument("--name", default="go2-camera-direct", help="Foxglove server name")
     return parser.parse_args()
@@ -81,20 +162,126 @@ def encode_jpeg(image: np.ndarray, quality: int) -> Optional[bytes]:
     return encoded.tobytes()
 
 
+def to_time_fields(now_ns: int) -> dict:
+    return {"sec": now_ns // 1_000_000_000, "nsec": now_ns % 1_000_000_000}
+
+
+async def stream_camera_loop(
+    args: argparse.Namespace,
+    server: FoxgloveServer,
+    channel_id: int,
+    client: VideoClient,
+) -> None:
+    period = 1.0 / args.fps if args.fps > 0 else 1.0 / 15.0
+
+    while True:
+        code, data = client.GetImageSample()
+        if code != 0:
+            await asyncio.sleep(0.05)
+            continue
+
+        image = decode_sdk_frame(data)
+        if image is None:
+            await asyncio.sleep(0.01)
+            continue
+
+        jpeg_bytes = encode_jpeg(image, args.jpeg_quality)
+        if jpeg_bytes is None:
+            await asyncio.sleep(0.01)
+            continue
+
+        now_ns = time.time_ns()
+        payload = {
+            "timestamp": to_time_fields(now_ns),
+            "frame_id": args.frame_id,
+            "format": "jpeg",
+            "data": base64.b64encode(jpeg_bytes).decode("ascii"),
+        }
+
+        await server.send_message(channel_id, now_ns, json.dumps(payload).encode("utf-8"))
+        await asyncio.sleep(period)
+
+
+async def stream_state_loop(
+    args: argparse.Namespace,
+    server: FoxgloveServer,
+    imu_channel_id: int,
+    motor_channel_id: int,
+    cache: LowStateCache,
+) -> None:
+    period = 1.0 / args.state_fps if args.state_fps > 0 else 1.0 / 50.0
+
+    while True:
+        state = cache.get()
+        if state is None:
+            await asyncio.sleep(0.02)
+            continue
+
+        now_ns = time.time_ns()
+
+        imu_payload = {
+            "timestamp": to_time_fields(now_ns),
+            "tick": int(state.tick),
+            "quaternion": [float(value) for value in state.imu_state.quaternion],
+            "gyroscope": [float(value) for value in state.imu_state.gyroscope],
+            "accelerometer": [float(value) for value in state.imu_state.accelerometer],
+            "rpy": [float(value) for value in state.imu_state.rpy],
+            "temperature": int(state.imu_state.temperature),
+        }
+        await server.send_message(imu_channel_id, now_ns, json.dumps(imu_payload).encode("utf-8"))
+
+        max_count = min(max(args.motor_count, 1), len(state.motor_state))
+        motors = []
+        for index in range(max_count):
+            motor = state.motor_state[index]
+            motors.append(
+                {
+                    "index": index,
+                    "mode": int(motor.mode),
+                    "q": float(motor.q),
+                    "dq": float(motor.dq),
+                    "ddq": float(motor.ddq),
+                    "tau_est": float(motor.tau_est),
+                    "temperature": int(motor.temperature),
+                    "lost": int(motor.lost),
+                }
+            )
+
+        motor_payload = {
+            "timestamp": to_time_fields(now_ns),
+            "tick": int(state.tick),
+            "motors": motors,
+        }
+        await server.send_message(motor_channel_id, now_ns, json.dumps(motor_payload).encode("utf-8"))
+
+        await asyncio.sleep(period)
+
+
 async def stream_camera(args: argparse.Namespace) -> None:
     bind_host = args.bind_host or get_interface_ipv4(args.ws_interface) or "0.0.0.0"
 
     ChannelFactoryInitialize(0, args.sdk_interface)
+
+    low_state_cache = LowStateCache()
+
+    def on_low_state(msg: LowState_) -> None:
+        low_state_cache.update(msg)
+
+    low_state_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
+    low_state_subscriber.Init(on_low_state, 10)
+
     client = VideoClient()
     client.SetTimeout(3.0)
     client.Init()
 
     print(f"[SDK] interface={args.sdk_interface}")
     print(f"[WS ] listening on ws://{bind_host}:{args.port}")
-    print(f"[WS ] topic={args.topic}")
+    print(f"[WS ] image topic={args.topic}")
+    print(f"[WS ] imu topic={args.imu_topic}")
+    print(f"[WS ] motor topic={args.motor_topic}")
 
     async with FoxgloveServer(bind_host, args.port, args.name, supported_encodings=["json"]) as server:
-        channel_id = await server.add_channel(
+        image_channel_id = await server.add_channel(
             {
                 "topic": args.topic,
                 "encoding": "json",
@@ -104,37 +291,30 @@ async def stream_camera(args: argparse.Namespace) -> None:
             }
         )
 
-        period = 1.0 / args.fps if args.fps > 0 else 1.0 / 15.0
-
-        while True:
-            code, data = client.GetImageSample()
-            if code != 0:
-                await asyncio.sleep(0.05)
-                continue
-
-            image = decode_sdk_frame(data)
-            if image is None:
-                await asyncio.sleep(0.01)
-                continue
-
-            jpeg_bytes = encode_jpeg(image, args.jpeg_quality)
-            if jpeg_bytes is None:
-                await asyncio.sleep(0.01)
-                continue
-
-            now_ns = time.time_ns()
-            sec = now_ns // 1_000_000_000
-            nsec = now_ns % 1_000_000_000
-
-            payload = {
-                "timestamp": {"sec": sec, "nsec": nsec},
-                "frame_id": args.frame_id,
-                "format": "jpeg",
-                "data": base64.b64encode(jpeg_bytes).decode("ascii"),
+        imu_channel_id = await server.add_channel(
+            {
+                "topic": args.imu_topic,
+                "encoding": "json",
+                "schemaName": "go2.IMUState",
+                "schemaEncoding": "jsonschema",
+                "schema": json.dumps(IMU_SCHEMA),
             }
+        )
 
-            await server.send_message(channel_id, now_ns, json.dumps(payload).encode("utf-8"))
-            await asyncio.sleep(period)
+        motor_channel_id = await server.add_channel(
+            {
+                "topic": args.motor_topic,
+                "encoding": "json",
+                "schemaName": "go2.MotorStates",
+                "schemaEncoding": "jsonschema",
+                "schema": json.dumps(MOTOR_STATES_SCHEMA),
+            }
+        )
+
+        await asyncio.gather(
+            stream_camera_loop(args, server, image_channel_id, client),
+            stream_state_loop(args, server, imu_channel_id, motor_channel_id, low_state_cache),
+        )
 
 
 def main() -> None:
