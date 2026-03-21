@@ -136,7 +136,6 @@ FOXGLOVE_POINT_CLOUD_SCHEMA = {
     "required": ["timestamp", "frame_id", "point_stride", "fields", "data", "point_count"],
 }
 
-
 class LowStateCache:
     def __init__(self):
         self._lock = Lock()

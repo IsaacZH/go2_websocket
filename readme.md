@@ -1,0 +1,1 @@
+python3 dds_to_foxglove.py --sdk-interface eth0 --ws-interface wlan0 --port 8765
