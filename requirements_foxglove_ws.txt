@@ -3,3 +3,5 @@ opencv-python
 foxglove-websocket
 websockets
 pynput
+PyQt5
+matplotlib
