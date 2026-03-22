@@ -174,7 +174,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imu-topic", default="/go2/imu", help="Foxglove IMU topic name")
     parser.add_argument("--motor-topic", default="/go2/motor_states", help="Foxglove motor state topic name")
     parser.add_argument("--lidar-topic", default="/go2/lidar/points", help="Foxglove lidar point cloud topic name")
-    parser.add_argument("--lidar-dds-topic", default="rt/utlidar/cloud", help="DDS topic of PointCloud2 from Unitree lidar")
+    parser.add_argument(
+        "--lidar-source",
+        choices=["deskewed", "raw"],
+        default="deskewed",
+        help="Lidar source: deskewed cloud in odom frame or raw cloud in lidar frame",
+    )
+    parser.add_argument(
+        "--lidar-dds-topic",
+        default=None,
+        help="Override DDS topic of PointCloud2; if not set, chosen by --lidar-source",
+    )
     parser.add_argument("--frame-id", default="go2_front_camera", help="Frame id in message")
     parser.add_argument("--fps", type=float, default=15.0, help="Publish FPS")
     parser.add_argument("--state-fps", type=float, default=50.0, help="Publish rate for IMU/motor topics")
@@ -216,7 +226,7 @@ def to_time_fields(now_ns: int) -> dict:
     return {"sec": now_ns // 1_000_000_000, "nsec": now_ns % 1_000_000_000}
 
 
-def pointcloud_to_payload(msg: PointCloud2_, max_points: int) -> Tuple[dict, int]:
+def pointcloud_to_payload(msg: PointCloud2_, max_points: int) -> Tuple[dict, int, bytes]:
     if max_points < 1:
         max_points = 1
 
@@ -257,7 +267,7 @@ def pointcloud_to_payload(msg: PointCloud2_, max_points: int) -> Tuple[dict, int
         "data": base64.b64encode(sampled_data).decode("ascii"),
         "point_count": sampled_points,
     }
-    return payload, sampled_points
+    return payload, sampled_points, sampled_data
 
 
 async def stream_camera_loop(
@@ -366,8 +376,9 @@ async def stream_lidar_loop(
             continue
 
         now_ns = time.time_ns()
-        payload, _sampled_points = pointcloud_to_payload(cloud, args.lidar_max_points)
+        payload, _sampled_points, _sampled_data = pointcloud_to_payload(cloud, args.lidar_max_points)
         await server.send_message(lidar_channel_id, now_ns, json.dumps(payload).encode("utf-8"))
+
         await asyncio.sleep(period)
 
 
@@ -375,6 +386,10 @@ async def stream_camera(args: argparse.Namespace) -> None:
     bind_host = args.bind_host or get_interface_ipv4(args.ws_interface) or "0.0.0.0"
 
     ChannelFactoryInitialize(0, args.sdk_interface)
+
+    lidar_dds_topic = args.lidar_dds_topic
+    if not lidar_dds_topic:
+        lidar_dds_topic = "rt/utlidar/cloud_deskewed" if args.lidar_source == "deskewed" else "rt/utlidar/cloud"
 
     low_state_cache = LowStateCache()
     pointcloud_cache = PointCloudCache()
@@ -388,7 +403,7 @@ async def stream_camera(args: argparse.Namespace) -> None:
     low_state_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
     low_state_subscriber.Init(on_low_state, 10)
 
-    lidar_subscriber = ChannelSubscriber(args.lidar_dds_topic, PointCloud2_)
+    lidar_subscriber = ChannelSubscriber(lidar_dds_topic, PointCloud2_)
     lidar_subscriber.Init(on_lidar_pointcloud, 3)
 
     client = VideoClient()
@@ -400,8 +415,11 @@ async def stream_camera(args: argparse.Namespace) -> None:
     print(f"[WS ] image topic={args.topic}")
     print(f"[WS ] imu topic={args.imu_topic}")
     print(f"[WS ] motor topic={args.motor_topic}")
-    print(f"[DDS] lidar topic={args.lidar_dds_topic}")
+    print(f"[DDS] lidar source={args.lidar_source}")
+    print(f"[DDS] lidar topic={lidar_dds_topic}")
     print(f"[WS ] lidar topic={args.lidar_topic}")
+    if args.lidar_source == "raw":
+        print("[WARN] raw lidar is in lidar frame, accumulated history may smear while robot moves")
 
     async with FoxgloveServer(bind_host, args.port, args.name, supported_encodings=["json"]) as server:
         image_channel_id = await server.add_channel(
