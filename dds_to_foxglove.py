@@ -493,8 +493,6 @@ async def stream_camera(args: argparse.Namespace) -> None:
     ChannelFactoryInitialize(0, args.sdk_interface)
 
     lidar_dds_topic = args.lidar_dds_topic
-    if not lidar_dds_topic:
-        lidar_dds_topic = "rt/utlidar/cloud_deskewed" if args.lidar_source == "deskewed" else "rt/utlidar/cloud"
 
     low_state_cache = LowStateCache()
     pointcloud_cache = PointCloudCache()
@@ -526,7 +524,6 @@ async def stream_camera(args: argparse.Namespace) -> None:
     print(f"[WS ] image topic={args.topic}")
     print(f"[WS ] imu topic={args.imu_topic}")
     print(f"[WS ] motor topic={args.motor_topic}")
-    print(f"[DDS] lidar source={args.lidar_source}")
     print(f"[DDS] lidar topic={lidar_dds_topic}")
     print(f"[WS ] lidar topic={args.lidar_topic}")
     print(f"[WS ] lidar history topic={args.lidar_history_topic}")
