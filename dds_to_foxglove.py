@@ -1,14 +1,14 @@
 import argparse
 import asyncio
 import base64
+from collections import deque
 import json
 import subprocess
 import sys
 import time
-from collections import deque
 from pathlib import Path
 from threading import Lock
-from typing import Deque, Optional, Tuple
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -165,24 +165,6 @@ class PointCloudCache:
             return self._latest
 
 
-class LidarHistoryCache:
-    def __init__(self):
-        self._lock = Lock()
-        self._entries: Deque[Tuple[int, dict, bytes, int]] = deque()
-        self._latest_meta: Optional[dict] = None
-
-    def add(self, stamp_ns: int, meta: dict, data_bytes: bytes, point_count: int) -> None:
-        with self._lock:
-            self._latest_meta = meta
-            self._entries.append((stamp_ns, meta, data_bytes, point_count))
-
-    def snapshot(self, cutoff_ns: int) -> Tuple[list, Optional[dict]]:
-        with self._lock:
-            while self._entries and self._entries[0][0] < cutoff_ns:
-                self._entries.popleft()
-            return list(self._entries), self._latest_meta
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stream Go2 camera to Foxglove WebSocket without ROS")
     parser.add_argument("--sdk-interface", default="eth0", help="Unitree SDK network interface, e.g. eth0/wlan0")
@@ -193,19 +175,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--imu-topic", default="/go2/imu", help="Foxglove IMU topic name")
     parser.add_argument("--motor-topic", default="/go2/motor_states", help="Foxglove motor state topic name")
     parser.add_argument("--lidar-topic", default="/go2/lidar/points", help="Foxglove lidar point cloud topic name")
+    parser.add_argument("--lidar-history-topic", default="/go2/lidar/points_history", help="Foxglove accumulated lidar point cloud topic name")
     parser.add_argument(
-        "--lidar-history-topic",
-        default="/go2/lidar/points_history",
-        help="Foxglove lidar history topic name",
+        "--lidar-source",
+        choices=["deskewed", "raw"],
+        default="deskewed",
+        help="Lidar source: deskewed cloud in odom frame or raw cloud in lidar frame",
     )
-    parser.add_argument("--lidar-dds-topic", default="rt/utlidar/cloud", help="DDS topic of PointCloud2 from Unitree lidar")
+    parser.add_argument(
+        "--lidar-dds-topic",
+        default=None,
+        help="Override DDS topic of PointCloud2; if not set, chosen by --lidar-source",
+    )
     parser.add_argument("--frame-id", default="go2_front_camera", help="Frame id in message")
     parser.add_argument("--fps", type=float, default=15.0, help="Publish FPS")
     parser.add_argument("--state-fps", type=float, default=50.0, help="Publish rate for IMU/motor topics")
     parser.add_argument("--lidar-fps", type=float, default=10.0, help="Publish rate for lidar point cloud topic")
-    parser.add_argument("--lidar-history-seconds", type=float, default=1.0, help="Seconds of lidar history to stack")
-    parser.add_argument("--lidar-history-fps", type=float, default=10.0, help="Publish rate for lidar history topic")
-    parser.add_argument("--lidar-history-max-points", type=int, default=120000, help="Max points after stacking history")
+    parser.add_argument("--lidar-history-frames", type=int, default=20, help="How many lidar frames to accumulate")
+    parser.add_argument("--lidar-history-max-points", type=int, default=100000, help="Max total points in accumulated lidar frame")
     parser.add_argument("--motor-count", type=int, default=12, help="How many motors to publish (Go2 usually 12)")
     parser.add_argument("--lidar-max-points", type=int, default=12000, help="Max point count per lidar frame (downsample if larger)")
     parser.add_argument("--jpeg-quality", type=int, default=80, help="JPEG quality 1-100")
@@ -284,50 +271,47 @@ def pointcloud_to_payload(msg: PointCloud2_, max_points: int) -> Tuple[dict, int
         "data": base64.b64encode(sampled_data).decode("ascii"),
         "point_count": sampled_points,
     }
-    return payload, sampled_points
+    return payload, sampled_points, sampled_data
 
 
-def pointcloud_to_raw(msg: PointCloud2_) -> Optional[Tuple[dict, bytes, int]]:
-    point_step = int(msg.point_step)
-    width = int(msg.width)
-    height = int(msg.height)
-    total_points = width * height
-    if point_step <= 0 or total_points <= 0:
-        return None
-    if int(msg.row_step) != width * point_step:
-        return None
+def downsample_point_bytes(data: bytes, point_step: int, max_points: int) -> Tuple[bytes, int]:
+    if point_step <= 0:
+        return b"", 0
 
-    data_bytes = bytes(msg.data)
-    meta = {
-        "frame_id": msg.header.frame_id,
-        "point_stride": point_step,
-        "fields": [
-            {
-                "name": field.name,
-                "offset": int(field.offset),
-                "type": int(field.datatype),
-                "count": int(field.count),
-            }
-            for field in msg.fields
-        ],
-    }
-    return meta, data_bytes, total_points
-
-
-def downsample_contiguous(data_bytes: bytes, point_step: int, total_points: int, max_points: int) -> Tuple[bytes, int]:
+    total_points = len(data) // point_step
     if max_points < 1:
-        return data_bytes[:point_step], 1
+        max_points = 1
     if total_points <= max_points:
-        return data_bytes, total_points
+        return data, total_points
 
     step = max(1, total_points // max_points)
     reduced = bytearray()
     for index in range(0, total_points, step):
         begin = index * point_step
         end = begin + point_step
-        reduced.extend(data_bytes[begin:end])
-    reduced_bytes = bytes(reduced)
-    return reduced_bytes, len(reduced_bytes) // point_step
+        reduced.extend(data[begin:end])
+    sampled = bytes(reduced)
+    return sampled, len(sampled) // point_step
+
+
+def build_history_payload(
+    frames: deque,
+    point_stride: int,
+    fields: list,
+    frame_id: str,
+    now_ns: int,
+    max_points: int,
+) -> dict:
+    merged_data = b"".join(frames)
+    merged_data, merged_points = downsample_point_bytes(merged_data, point_stride, max_points)
+    return {
+        "timestamp": to_time_fields(now_ns),
+        "frame_id": frame_id,
+        "point_stride": point_stride,
+        "fields": fields,
+        "data": base64.b64encode(merged_data).decode("ascii"),
+        "point_count": merged_points,
+    }
 
 
 async def stream_camera_loop(
@@ -425,9 +409,16 @@ async def stream_lidar_loop(
     args: argparse.Namespace,
     server: FoxgloveServer,
     lidar_channel_id: int,
+    lidar_history_channel_id: int,
     cache: PointCloudCache,
 ) -> None:
     period = 1.0 / args.lidar_fps if args.lidar_fps > 0 else 1.0 / 10.0
+    history_frame_count = max(1, args.lidar_history_frames)
+    history_frames: deque[bytes] = deque(maxlen=history_frame_count)
+    history_point_stride = 0
+    history_fields = []
+    history_frame_id = ""
+    last_cloud_stamp: Optional[Tuple[int, int]] = None
 
     while True:
         cloud = cache.get()
@@ -436,54 +427,44 @@ async def stream_lidar_loop(
             continue
 
         now_ns = time.time_ns()
-        payload, _sampled_points, _sampled_data = pointcloud_to_payload(cloud, args.lidar_max_points)
+        payload, _sampled_points, sampled_data = pointcloud_to_payload(cloud, args.lidar_max_points)
         await server.send_message(lidar_channel_id, now_ns, json.dumps(payload).encode("utf-8"))
-        await asyncio.sleep(period)
 
+        stamp_key = (int(cloud.header.stamp.sec), int(cloud.header.stamp.nanosec))
+        if stamp_key != last_cloud_stamp:
+            last_cloud_stamp = stamp_key
 
-async def stream_lidar_history_loop(
-    args: argparse.Namespace,
-    server: FoxgloveServer,
-    lidar_history_channel_id: int,
-    cache: LidarHistoryCache,
-) -> None:
-    if args.lidar_history_seconds <= 0:
-        return
+            point_stride = int(payload["point_stride"])
+            fields = payload["fields"]
+            frame_id = str(payload["frame_id"])
 
-    period = 1.0 / args.lidar_history_fps if args.lidar_history_fps > 0 else 1.0 / 10.0
+            if (
+                point_stride != history_point_stride
+                or fields != history_fields
+                or frame_id != history_frame_id
+            ):
+                history_frames.clear()
+                history_point_stride = point_stride
+                history_fields = fields
+                history_frame_id = frame_id
 
-    while True:
-        now_ns = time.time_ns()
-        cutoff = now_ns - int(args.lidar_history_seconds * 1_000_000_000)
-        entries, meta = cache.snapshot(cutoff)
-        if not entries or meta is None:
-            await asyncio.sleep(period)
-            continue
+            history_frames.append(sampled_data)
 
-        all_data = bytearray()
-        total_points = 0
-        point_step = int(meta["point_stride"])
-
-        for _stamp, _meta, data_bytes, points in entries:
-            all_data.extend(data_bytes)
-            total_points += points
-
-        if total_points > args.lidar_history_max_points:
-            sampled, sampled_points = downsample_contiguous(
-                bytes(all_data), point_step, total_points, args.lidar_history_max_points
+        if history_frames:
+            history_payload = build_history_payload(
+                history_frames,
+                history_point_stride,
+                history_fields,
+                history_frame_id,
+                now_ns,
+                args.lidar_history_max_points,
             )
-            all_data = bytearray(sampled)
-            total_points = sampled_points
+            await server.send_message(
+                lidar_history_channel_id,
+                now_ns,
+                json.dumps(history_payload).encode("utf-8"),
+            )
 
-        payload = {
-            "timestamp": to_time_fields(now_ns),
-            "frame_id": meta["frame_id"],
-            "point_stride": point_step,
-            "fields": meta["fields"],
-            "data": base64.b64encode(bytes(all_data)).decode("ascii"),
-            "point_count": total_points,
-        }
-        await server.send_message(lidar_history_channel_id, now_ns, json.dumps(payload).encode("utf-8"))
         await asyncio.sleep(period)
 
 
@@ -493,21 +474,17 @@ async def stream_camera(args: argparse.Namespace) -> None:
     ChannelFactoryInitialize(0, args.sdk_interface)
 
     lidar_dds_topic = args.lidar_dds_topic
+    if not lidar_dds_topic:
+        lidar_dds_topic = "rt/utlidar/cloud_deskewed" if args.lidar_source == "deskewed" else "rt/utlidar/cloud"
 
     low_state_cache = LowStateCache()
     pointcloud_cache = PointCloudCache()
-    lidar_history_cache = LidarHistoryCache()
 
     def on_low_state(msg: LowState_) -> None:
         low_state_cache.update(msg)
 
     def on_lidar_pointcloud(msg: PointCloud2_) -> None:
         pointcloud_cache.update(msg)
-        raw = pointcloud_to_raw(msg)
-        if raw is None:
-            return
-        meta, data_bytes, total_points = raw
-        lidar_history_cache.add(time.time_ns(), meta, data_bytes, total_points)
 
     low_state_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
     low_state_subscriber.Init(on_low_state, 10)
@@ -524,9 +501,12 @@ async def stream_camera(args: argparse.Namespace) -> None:
     print(f"[WS ] image topic={args.topic}")
     print(f"[WS ] imu topic={args.imu_topic}")
     print(f"[WS ] motor topic={args.motor_topic}")
+    print(f"[DDS] lidar source={args.lidar_source}")
     print(f"[DDS] lidar topic={lidar_dds_topic}")
     print(f"[WS ] lidar topic={args.lidar_topic}")
     print(f"[WS ] lidar history topic={args.lidar_history_topic}")
+    if args.lidar_source == "raw":
+        print("[WARN] raw lidar is in lidar frame, accumulated history may smear while robot moves")
 
     async with FoxgloveServer(bind_host, args.port, args.name, supported_encodings=["json"]) as server:
         image_channel_id = await server.add_channel(
@@ -582,8 +562,7 @@ async def stream_camera(args: argparse.Namespace) -> None:
         await asyncio.gather(
             stream_camera_loop(args, server, image_channel_id, client),
             stream_state_loop(args, server, imu_channel_id, motor_channel_id, low_state_cache),
-            stream_lidar_loop(args, server, lidar_channel_id, pointcloud_cache),
-            stream_lidar_history_loop(args, server, lidar_history_channel_id, lidar_history_cache),
+            stream_lidar_loop(args, server, lidar_channel_id, lidar_history_channel_id, pointcloud_cache),
         )
 
 
