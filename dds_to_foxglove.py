@@ -436,7 +436,7 @@ async def stream_lidar_loop(
             continue
 
         now_ns = time.time_ns()
-        payload, _sampled_points, _sampled_data = pointcloud_to_payload(cloud, args.lidar_max_points)
+        payload, _sampled_points = pointcloud_to_payload(cloud, args.lidar_max_points)
         await server.send_message(lidar_channel_id, now_ns, json.dumps(payload).encode("utf-8"))
         await asyncio.sleep(period)
 
