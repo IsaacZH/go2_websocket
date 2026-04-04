@@ -14,6 +14,7 @@ if str(SDK_REPO_PATH) not in sys.path:
     sys.path.insert(0, str(SDK_REPO_PATH))
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.go2.obstacles_avoid.obstacles_avoid_client import ObstaclesAvoidClient
 from unitree_sdk2py.go2.sport.sport_client import SportClient
 
 PROTOCOL_VERSION = "go2.ctrl.v1"
@@ -47,6 +48,7 @@ class ControlPipelineServer:
             maxsize=max(1, args.control_queue_size)
         )
         self.sport_client: Optional[SportClient] = None
+        self.obstacles_client: Optional[ObstaclesAvoidClient] = None
         self.last_heartbeat_ms: Dict[WebSocketServerProtocol, int] = {}
 
     async def start(self) -> None:
@@ -55,6 +57,10 @@ class ControlPipelineServer:
         self.sport_client = SportClient()
         self.sport_client.SetTimeout(self.args.sport_timeout)
         self.sport_client.Init()
+
+        self.obstacles_client = ObstaclesAvoidClient()
+        self.obstacles_client.SetTimeout(self.args.sport_timeout)
+        self.obstacles_client.Init()
 
         print(f"[CTL] SDK interface={self.args.sdk_interface}")
         print(f"[CTL] ws://{self.args.host}:{self.args.port}{self.args.path}")
@@ -126,6 +132,7 @@ class ControlPipelineServer:
 
     async def execute_loop(self) -> None:
         assert self.sport_client is not None
+        assert self.obstacles_client is not None
 
         while True:
             envelope, websocket = await self.command_queue.get()
@@ -168,6 +175,15 @@ class ControlPipelineServer:
                     if duration_ms > 0:
                         await asyncio.sleep(duration_ms / 1000.0)
                         self.sport_client.StopMove()
+                elif command_name == "set_obstacle_avoidance":
+                    enabled = bool(params.get("enabled", True))
+                    self.obstacles_client.SwitchSet(enabled)
+                elif command_name == "sport_api":
+                    api_id = int(params.get("api_id", -1))
+                    parameter = params.get("parameter", {})
+                    if not isinstance(parameter, dict):
+                        parameter = {}
+                    self._execute_sport_api(api_id, parameter)
                 else:
                     print(f"[CTL] unsupported id={command_id} cmd={command_name}")
 
@@ -178,6 +194,64 @@ class ControlPipelineServer:
                 print(f"[CTL] failed id={command_id} cmd={command_name} err={error}")
             finally:
                 self.command_queue.task_done()
+
+    def _execute_sport_api(self, api_id: int, parameter: Dict) -> None:
+        assert self.sport_client is not None
+
+        if api_id == 1001:
+            self.sport_client.Damp()
+        elif api_id == 1002:
+            self.sport_client.BalanceStand()
+        elif api_id == 1003:
+            self.sport_client.StopMove()
+        elif api_id == 1004:
+            self.sport_client.StandUp()
+        elif api_id == 1005:
+            self.sport_client.StandDown()
+        elif api_id == 1006:
+            self.sport_client.RecoveryStand()
+        elif api_id == 1009:
+            self.sport_client.Sit()
+        elif api_id == 1010:
+            self.sport_client.RiseSit()
+        elif api_id == 1015:
+            self.sport_client.SpeedLevel(int(parameter.get("data", 0)))
+        elif api_id == 1016:
+            self.sport_client.Hello()
+        elif api_id == 1017:
+            self.sport_client.Stretch()
+        elif api_id == 1020:
+            self.sport_client.Content()
+        elif api_id == 1022:
+            self.sport_client.Dance1()
+        elif api_id == 1023:
+            self.sport_client.Dance2()
+        elif api_id == 1027:
+            self.sport_client.SwitchJoystick(bool(parameter.get("data", True)))
+        elif api_id == 1028:
+            self.sport_client.Pose(bool(parameter.get("data", True)))
+        elif api_id == 1029:
+            self.sport_client.Scrape()
+        elif api_id == 1030:
+            self.sport_client.FrontFlip()
+        elif api_id == 1031:
+            self.sport_client.FrontJump()
+        elif api_id == 1032:
+            self.sport_client.FrontPounce()
+        elif api_id == 1036:
+            self.sport_client.Heart()
+        elif api_id in (1042, 2041):
+            self.sport_client.LeftFlip()
+        elif api_id in (1044, 2043):
+            self.sport_client.BackFlip()
+        elif api_id == 1302:
+            self.sport_client.CrossStep(True)
+        elif api_id == 1304:
+            self.sport_client.FreeBound(True)
+        elif api_id == 1305:
+            raise ValueError("MoonWalk (api_id=1305) is not available in sdkpy SportClient")
+        else:
+            raise ValueError(f"Unsupported sport api_id: {api_id}")
 
     async def send_event(
         self,
