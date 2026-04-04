@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 from threading import Lock
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
