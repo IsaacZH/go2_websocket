@@ -1,14 +1,13 @@
 import argparse
 import asyncio
 import base64
-from collections import deque
 import json
 import subprocess
 import sys
 import time
 from pathlib import Path
 from threading import Lock
-from typing import Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -20,9 +19,9 @@ if str(SDK_REPO_PATH) not in sys.path:
     sys.path.insert(0, str(SDK_REPO_PATH))
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
+from unitree_sdk2py.idl.geometry_msgs.msg.dds_ import PoseStamped_
 from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
 from unitree_sdk2py.go2.video.video_client import VideoClient
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
 
 
 COMPRESSED_IMAGE_SCHEMA = {
@@ -43,7 +42,7 @@ COMPRESSED_IMAGE_SCHEMA = {
     "required": ["timestamp", "frame_id", "format", "data"],
 }
 
-IMU_SCHEMA = {
+POSE_STAMPED_SCHEMA = {
     "type": "object",
     "properties": {
         "timestamp": {
@@ -54,55 +53,28 @@ IMU_SCHEMA = {
             },
             "required": ["sec", "nsec"],
         },
-        "tick": {"type": "integer"},
-        "quaternion": {"type": "array", "items": {"type": "number"}},
-        "gyroscope": {"type": "array", "items": {"type": "number"}},
-        "accelerometer": {"type": "array", "items": {"type": "number"}},
-        "rpy": {"type": "array", "items": {"type": "number"}},
-        "temperature": {"type": "integer"},
-    },
-    "required": [
-        "timestamp",
-        "tick",
-        "quaternion",
-        "gyroscope",
-        "accelerometer",
-        "rpy",
-        "temperature",
-    ],
-}
-
-MOTOR_STATES_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "timestamp": {
+        "frame_id": {"type": "string"},
+        "position": {
             "type": "object",
             "properties": {
-                "sec": {"type": "integer"},
-                "nsec": {"type": "integer"},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "z": {"type": "number"},
             },
-            "required": ["sec", "nsec"],
+            "required": ["x", "y", "z"],
         },
-        "tick": {"type": "integer"},
-        "motors": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "index": {"type": "integer"},
-                    "mode": {"type": "integer"},
-                    "q": {"type": "number"},
-                    "dq": {"type": "number"},
-                    "ddq": {"type": "number"},
-                    "tau_est": {"type": "number"},
-                    "temperature": {"type": "integer"},
-                    "lost": {"type": "integer"},
-                },
-                "required": ["index", "mode", "q", "dq", "ddq", "tau_est", "temperature", "lost"],
+        "orientation": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "z": {"type": "number"},
+                "w": {"type": "number"},
             },
+            "required": ["x", "y", "z", "w"],
         },
     },
-    "required": ["timestamp", "tick", "motors"],
+    "required": ["timestamp", "frame_id", "position", "orientation"],
 }
 
 FOXGLOVE_POINT_CLOUD_SCHEMA = {
@@ -137,16 +109,16 @@ FOXGLOVE_POINT_CLOUD_SCHEMA = {
     "required": ["timestamp", "frame_id", "point_stride", "fields", "data", "point_count"],
 }
 
-class LowStateCache:
+class OdomCache:
     def __init__(self):
         self._lock = Lock()
-        self._latest: Optional[LowState_] = None
+        self._latest: Optional[PoseStamped_] = None
 
-    def update(self, msg: LowState_) -> None:
+    def update(self, msg: PoseStamped_) -> None:
         with self._lock:
             self._latest = msg
 
-    def get(self) -> Optional[LowState_]:
+    def get(self) -> Optional[PoseStamped_]:
         with self._lock:
             return self._latest
 
@@ -172,10 +144,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bind-host", default=None, help="WebSocket bind IP; default uses --ws-interface IPv4")
     parser.add_argument("--port", type=int, default=8765, help="WebSocket port")
     parser.add_argument("--topic", default="/go2/front_camera/compressed", help="Foxglove topic name")
-    parser.add_argument("--imu-topic", default="/go2/imu", help="Foxglove IMU topic name")
-    parser.add_argument("--motor-topic", default="/go2/motor_states", help="Foxglove motor state topic name")
+    parser.add_argument("--odom-topic", default="/go2/odom", help="Foxglove odom pose topic name")
     parser.add_argument("--lidar-topic", default="/go2/lidar/points", help="Foxglove lidar point cloud topic name")
-    parser.add_argument("--lidar-history-topic", default="/go2/lidar/points_history", help="Foxglove accumulated lidar point cloud topic name")
     parser.add_argument(
         "--lidar-source",
         choices=["deskewed", "raw"],
@@ -187,13 +157,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override DDS topic of PointCloud2; if not set, chosen by --lidar-source",
     )
+    parser.add_argument(
+        "--odom-dds-topic",
+        default="rt/utlidar/robot_pose",
+        help="DDS topic of geometry_msgs/PoseStamped odom pose",
+    )
     parser.add_argument("--frame-id", default="go2_front_camera", help="Frame id in message")
     parser.add_argument("--fps", type=float, default=15.0, help="Publish FPS")
-    parser.add_argument("--state-fps", type=float, default=50.0, help="Publish rate for IMU/motor topics")
+    parser.add_argument("--odom-fps", type=float, default=30.0, help="Publish rate for odom topic")
     parser.add_argument("--lidar-fps", type=float, default=10.0, help="Publish rate for lidar point cloud topic")
-    parser.add_argument("--lidar-history-frames", type=int, default=20, help="How many lidar frames to accumulate")
-    parser.add_argument("--lidar-history-max-points", type=int, default=100000, help="Max total points in accumulated lidar frame")
-    parser.add_argument("--motor-count", type=int, default=12, help="How many motors to publish (Go2 usually 12)")
     parser.add_argument("--lidar-max-points", type=int, default=12000, help="Max point count per lidar frame (downsample if larger)")
     parser.add_argument("--jpeg-quality", type=int, default=80, help="JPEG quality 1-100")
     parser.add_argument("--name", default="go2", help="Foxglove server name")
@@ -274,46 +246,6 @@ def pointcloud_to_payload(msg: PointCloud2_, max_points: int) -> Tuple[dict, int
     return payload, sampled_points, sampled_data
 
 
-def downsample_point_bytes(data: bytes, point_step: int, max_points: int) -> Tuple[bytes, int]:
-    if point_step <= 0:
-        return b"", 0
-
-    total_points = len(data) // point_step
-    if max_points < 1:
-        max_points = 1
-    if total_points <= max_points:
-        return data, total_points
-
-    step = max(1, total_points // max_points)
-    reduced = bytearray()
-    for index in range(0, total_points, step):
-        begin = index * point_step
-        end = begin + point_step
-        reduced.extend(data[begin:end])
-    sampled = bytes(reduced)
-    return sampled, len(sampled) // point_step
-
-
-def build_history_payload(
-    frames: deque,
-    point_stride: int,
-    fields: list,
-    frame_id: str,
-    now_ns: int,
-    max_points: int,
-) -> dict:
-    merged_data = b"".join(frames)
-    merged_data, merged_points = downsample_point_bytes(merged_data, point_stride, max_points)
-    return {
-        "timestamp": to_time_fields(now_ns),
-        "frame_id": frame_id,
-        "point_stride": point_stride,
-        "fields": fields,
-        "data": base64.b64encode(merged_data).decode("ascii"),
-        "point_count": merged_points,
-    }
-
-
 async def stream_camera_loop(
     args: argparse.Namespace,
     server: FoxgloveServer,
@@ -350,57 +282,38 @@ async def stream_camera_loop(
         await asyncio.sleep(period)
 
 
-async def stream_state_loop(
+async def stream_odom_loop(
     args: argparse.Namespace,
     server: FoxgloveServer,
-    imu_channel_id: int,
-    motor_channel_id: int,
-    cache: LowStateCache,
+    odom_channel_id: int,
+    cache: OdomCache,
 ) -> None:
-    period = 1.0 / args.state_fps if args.state_fps > 0 else 1.0 / 50.0
+    period = 1.0 / args.odom_fps if args.odom_fps > 0 else 1.0 / 30.0
 
     while True:
-        state = cache.get()
-        if state is None:
+        odom = cache.get()
+        if odom is None:
             await asyncio.sleep(0.02)
             continue
 
         now_ns = time.time_ns()
 
-        imu_payload = {
+        payload = {
             "timestamp": to_time_fields(now_ns),
-            "tick": int(state.tick),
-            "quaternion": [float(value) for value in state.imu_state.quaternion],
-            "gyroscope": [float(value) for value in state.imu_state.gyroscope],
-            "accelerometer": [float(value) for value in state.imu_state.accelerometer],
-            "rpy": [float(value) for value in state.imu_state.rpy],
-            "temperature": int(state.imu_state.temperature),
+            "frame_id": str(odom.header.frame_id),
+            "position": {
+                "x": float(odom.pose.position.x),
+                "y": float(odom.pose.position.y),
+                "z": float(odom.pose.position.z),
+            },
+            "orientation": {
+                "x": float(odom.pose.orientation.x),
+                "y": float(odom.pose.orientation.y),
+                "z": float(odom.pose.orientation.z),
+                "w": float(odom.pose.orientation.w),
+            },
         }
-        await server.send_message(imu_channel_id, now_ns, json.dumps(imu_payload).encode("utf-8"))
-
-        max_count = min(max(args.motor_count, 1), len(state.motor_state))
-        motors = []
-        for index in range(max_count):
-            motor = state.motor_state[index]
-            motors.append(
-                {
-                    "index": index,
-                    "mode": int(motor.mode),
-                    "q": float(motor.q),
-                    "dq": float(motor.dq),
-                    "ddq": float(motor.ddq),
-                    "tau_est": float(motor.tau_est),
-                    "temperature": int(motor.temperature),
-                    "lost": int(motor.lost),
-                }
-            )
-
-        motor_payload = {
-            "timestamp": to_time_fields(now_ns),
-            "tick": int(state.tick),
-            "motors": motors,
-        }
-        await server.send_message(motor_channel_id, now_ns, json.dumps(motor_payload).encode("utf-8"))
+        await server.send_message(odom_channel_id, now_ns, json.dumps(payload).encode("utf-8"))
 
         await asyncio.sleep(period)
 
@@ -409,16 +322,9 @@ async def stream_lidar_loop(
     args: argparse.Namespace,
     server: FoxgloveServer,
     lidar_channel_id: int,
-    lidar_history_channel_id: int,
     cache: PointCloudCache,
 ) -> None:
     period = 1.0 / args.lidar_fps if args.lidar_fps > 0 else 1.0 / 10.0
-    history_frame_count = max(1, args.lidar_history_frames)
-    history_frames: deque[bytes] = deque(maxlen=history_frame_count)
-    history_point_stride = 0
-    history_fields = []
-    history_frame_id = ""
-    last_cloud_stamp: Optional[Tuple[int, int]] = None
 
     while True:
         cloud = cache.get()
@@ -427,43 +333,8 @@ async def stream_lidar_loop(
             continue
 
         now_ns = time.time_ns()
-        payload, _sampled_points, sampled_data = pointcloud_to_payload(cloud, args.lidar_max_points)
+        payload, _sampled_points, _sampled_data = pointcloud_to_payload(cloud, args.lidar_max_points)
         await server.send_message(lidar_channel_id, now_ns, json.dumps(payload).encode("utf-8"))
-
-        stamp_key = (int(cloud.header.stamp.sec), int(cloud.header.stamp.nanosec))
-        if stamp_key != last_cloud_stamp:
-            last_cloud_stamp = stamp_key
-
-            point_stride = int(payload["point_stride"])
-            fields = payload["fields"]
-            frame_id = str(payload["frame_id"])
-
-            if (
-                point_stride != history_point_stride
-                or fields != history_fields
-                or frame_id != history_frame_id
-            ):
-                history_frames.clear()
-                history_point_stride = point_stride
-                history_fields = fields
-                history_frame_id = frame_id
-
-            history_frames.append(sampled_data)
-
-        if history_frames:
-            history_payload = build_history_payload(
-                history_frames,
-                history_point_stride,
-                history_fields,
-                history_frame_id,
-                now_ns,
-                args.lidar_history_max_points,
-            )
-            await server.send_message(
-                lidar_history_channel_id,
-                now_ns,
-                json.dumps(history_payload).encode("utf-8"),
-            )
 
         await asyncio.sleep(period)
 
@@ -477,17 +348,17 @@ async def stream_camera(args: argparse.Namespace) -> None:
     if not lidar_dds_topic:
         lidar_dds_topic = "rt/utlidar/cloud_deskewed" if args.lidar_source == "deskewed" else "rt/utlidar/cloud"
 
-    low_state_cache = LowStateCache()
+    odom_cache = OdomCache()
     pointcloud_cache = PointCloudCache()
 
-    def on_low_state(msg: LowState_) -> None:
-        low_state_cache.update(msg)
+    def on_odom(msg: PoseStamped_) -> None:
+        odom_cache.update(msg)
 
     def on_lidar_pointcloud(msg: PointCloud2_) -> None:
         pointcloud_cache.update(msg)
 
-    low_state_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
-    low_state_subscriber.Init(on_low_state, 10)
+    odom_subscriber = ChannelSubscriber(args.odom_dds_topic, PoseStamped_)
+    odom_subscriber.Init(on_odom, 10)
 
     lidar_subscriber = ChannelSubscriber(lidar_dds_topic, PointCloud2_)
     lidar_subscriber.Init(on_lidar_pointcloud, 3)
@@ -499,14 +370,13 @@ async def stream_camera(args: argparse.Namespace) -> None:
     print(f"[SDK] interface={args.sdk_interface}")
     print(f"[WS ] listening on ws://{bind_host}:{args.port}")
     print(f"[WS ] image topic={args.topic}")
-    print(f"[WS ] imu topic={args.imu_topic}")
-    print(f"[WS ] motor topic={args.motor_topic}")
+    print(f"[DDS] odom topic={args.odom_dds_topic}")
+    print(f"[WS ] odom topic={args.odom_topic}")
     print(f"[DDS] lidar source={args.lidar_source}")
     print(f"[DDS] lidar topic={lidar_dds_topic}")
     print(f"[WS ] lidar topic={args.lidar_topic}")
-    print(f"[WS ] lidar history topic={args.lidar_history_topic}")
     if args.lidar_source == "raw":
-        print("[WARN] raw lidar is in lidar frame, accumulated history may smear while robot moves")
+        print("[WARN] raw lidar is in lidar frame (not deskewed/world-aligned)")
 
     async with FoxgloveServer(bind_host, args.port, args.name, supported_encodings=["json"]) as server:
         image_channel_id = await server.add_channel(
@@ -519,23 +389,13 @@ async def stream_camera(args: argparse.Namespace) -> None:
             }
         )
 
-        imu_channel_id = await server.add_channel(
+        odom_channel_id = await server.add_channel(
             {
-                "topic": args.imu_topic,
+                "topic": args.odom_topic,
                 "encoding": "json",
-                "schemaName": "go2.IMUState",
+                "schemaName": "geometry_msgs.PoseStamped",
                 "schemaEncoding": "jsonschema",
-                "schema": json.dumps(IMU_SCHEMA),
-            }
-        )
-
-        motor_channel_id = await server.add_channel(
-            {
-                "topic": args.motor_topic,
-                "encoding": "json",
-                "schemaName": "go2.MotorStates",
-                "schemaEncoding": "jsonschema",
-                "schema": json.dumps(MOTOR_STATES_SCHEMA),
+                "schema": json.dumps(POSE_STAMPED_SCHEMA),
             }
         )
 
@@ -549,20 +409,10 @@ async def stream_camera(args: argparse.Namespace) -> None:
             }
         )
 
-        lidar_history_channel_id = await server.add_channel(
-            {
-                "topic": args.lidar_history_topic,
-                "encoding": "json",
-                "schemaName": "foxglove.PointCloud",
-                "schemaEncoding": "jsonschema",
-                "schema": json.dumps(FOXGLOVE_POINT_CLOUD_SCHEMA),
-            }
-        )
-
         await asyncio.gather(
             stream_camera_loop(args, server, image_channel_id, client),
-            stream_state_loop(args, server, imu_channel_id, motor_channel_id, low_state_cache),
-            stream_lidar_loop(args, server, lidar_channel_id, lidar_history_channel_id, pointcloud_cache),
+            stream_odom_loop(args, server, odom_channel_id, odom_cache),
+            stream_lidar_loop(args, server, lidar_channel_id, pointcloud_cache),
         )
 
 
