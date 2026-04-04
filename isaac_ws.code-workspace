@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../unitree_sdk2_python"
+		}
+	],
+	"settings": {}
+}
