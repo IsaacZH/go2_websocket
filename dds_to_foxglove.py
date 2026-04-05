@@ -21,6 +21,7 @@ if str(SDK_REPO_PATH) not in sys.path:
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
 from unitree_sdk2py.idl.geometry_msgs.msg.dds_ import PoseStamped_
 from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
 from unitree_sdk2py.go2.video.video_client import VideoClient
 
 
@@ -77,6 +78,68 @@ POSE_STAMPED_SCHEMA = {
     "required": ["timestamp", "frame_id", "position", "orientation"],
 }
 
+IMU_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "timestamp": {
+            "type": "object",
+            "properties": {
+                "sec": {"type": "integer"},
+                "nsec": {"type": "integer"},
+            },
+            "required": ["sec", "nsec"],
+        },
+        "tick": {"type": "integer"},
+        "quaternion": {"type": "array", "items": {"type": "number"}},
+        "gyroscope": {"type": "array", "items": {"type": "number"}},
+        "accelerometer": {"type": "array", "items": {"type": "number"}},
+        "rpy": {"type": "array", "items": {"type": "number"}},
+        "temperature": {"type": "integer"},
+    },
+    "required": [
+        "timestamp",
+        "tick",
+        "quaternion",
+        "gyroscope",
+        "accelerometer",
+        "rpy",
+        "temperature",
+    ],
+}
+
+MOTOR_STATES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "timestamp": {
+            "type": "object",
+            "properties": {
+                "sec": {"type": "integer"},
+                "nsec": {"type": "integer"},
+            },
+            "required": ["sec", "nsec"],
+        },
+        "tick": {"type": "integer"},
+        "motors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "mode": {"type": "integer"},
+                    "q": {"type": "number"},
+                    "dq": {"type": "number"},
+                    "ddq": {"type": "number"},
+                    "tau_est": {"type": "number"},
+                    "temperature": {"type": "integer"},
+                    "lost": {"type": "integer"},
+                },
+                "required": ["index", "mode", "q", "dq", "ddq", "tau_est", "temperature", "lost"],
+            },
+        },
+    },
+    "required": ["timestamp", "tick", "motors"],
+}
+
 FOXGLOVE_POINT_CLOUD_SCHEMA = {
     "type": "object",
     "properties": {
@@ -123,6 +186,20 @@ class OdomCache:
             return self._latest
 
 
+class LowStateCache:
+    def __init__(self):
+        self._lock = Lock()
+        self._latest: Optional[LowState_] = None
+
+    def update(self, msg: LowState_) -> None:
+        with self._lock:
+            self._latest = msg
+
+    def get(self) -> Optional[LowState_]:
+        with self._lock:
+            return self._latest
+
+
 class PointCloudCache:
     def __init__(self):
         self._lock = Lock()
@@ -144,6 +221,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bind-host", default=None, help="WebSocket bind IP; default uses --ws-interface IPv4")
     parser.add_argument("--port", type=int, default=8765, help="WebSocket port")
     parser.add_argument("--topic", default="/go2/front_camera/compressed", help="Foxglove topic name")
+    parser.add_argument("--imu-topic", default="/go2/imu", help="Foxglove IMU topic name")
+    parser.add_argument("--motor-topic", default="/go2/motor_states", help="Foxglove motor state topic name")
     parser.add_argument("--odom-topic", default="/go2/odom", help="Foxglove odom pose topic name")
     parser.add_argument("--lidar-topic", default="/go2/lidar/points", help="Foxglove lidar point cloud topic name")
     parser.add_argument(
@@ -164,8 +243,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--frame-id", default="go2_front_camera", help="Frame id in message")
     parser.add_argument("--fps", type=float, default=15.0, help="Publish FPS")
+    parser.add_argument("--state-fps", type=float, default=50.0, help="Publish rate for IMU/motor topics")
     parser.add_argument("--odom-fps", type=float, default=30.0, help="Publish rate for odom topic")
     parser.add_argument("--lidar-fps", type=float, default=10.0, help="Publish rate for lidar point cloud topic")
+    parser.add_argument("--motor-count", type=int, default=12, help="How many motors to publish (Go2 usually 12)")
     parser.add_argument("--lidar-max-points", type=int, default=12000, help="Max point count per lidar frame (downsample if larger)")
     parser.add_argument("--jpeg-quality", type=int, default=80, help="JPEG quality 1-100")
     parser.add_argument("--name", default="go2", help="Foxglove server name")
@@ -318,6 +399,61 @@ async def stream_odom_loop(
         await asyncio.sleep(period)
 
 
+async def stream_state_loop(
+    args: argparse.Namespace,
+    server: FoxgloveServer,
+    imu_channel_id: int,
+    motor_channel_id: int,
+    cache: LowStateCache,
+) -> None:
+    period = 1.0 / args.state_fps if args.state_fps > 0 else 1.0 / 50.0
+
+    while True:
+        state = cache.get()
+        if state is None:
+            await asyncio.sleep(0.02)
+            continue
+
+        now_ns = time.time_ns()
+
+        imu_payload = {
+            "timestamp": to_time_fields(now_ns),
+            "tick": int(state.tick),
+            "quaternion": [float(value) for value in state.imu_state.quaternion],
+            "gyroscope": [float(value) for value in state.imu_state.gyroscope],
+            "accelerometer": [float(value) for value in state.imu_state.accelerometer],
+            "rpy": [float(value) for value in state.imu_state.rpy],
+            "temperature": int(state.imu_state.temperature),
+        }
+        await server.send_message(imu_channel_id, now_ns, json.dumps(imu_payload).encode("utf-8"))
+
+        max_count = min(max(args.motor_count, 1), len(state.motor_state))
+        motors = []
+        for index in range(max_count):
+            motor = state.motor_state[index]
+            motors.append(
+                {
+                    "index": index,
+                    "mode": int(motor.mode),
+                    "q": float(motor.q),
+                    "dq": float(motor.dq),
+                    "ddq": float(motor.ddq),
+                    "tau_est": float(motor.tau_est),
+                    "temperature": int(motor.temperature),
+                    "lost": int(motor.lost),
+                }
+            )
+
+        motor_payload = {
+            "timestamp": to_time_fields(now_ns),
+            "tick": int(state.tick),
+            "motors": motors,
+        }
+        await server.send_message(motor_channel_id, now_ns, json.dumps(motor_payload).encode("utf-8"))
+
+        await asyncio.sleep(period)
+
+
 async def stream_lidar_loop(
     args: argparse.Namespace,
     server: FoxgloveServer,
@@ -348,14 +484,21 @@ async def stream_camera(args: argparse.Namespace) -> None:
     if not lidar_dds_topic:
         lidar_dds_topic = "rt/utlidar/cloud_deskewed" if args.lidar_source == "deskewed" else "rt/utlidar/cloud"
 
+    low_state_cache = LowStateCache()
     odom_cache = OdomCache()
     pointcloud_cache = PointCloudCache()
+
+    def on_low_state(msg: LowState_) -> None:
+        low_state_cache.update(msg)
 
     def on_odom(msg: PoseStamped_) -> None:
         odom_cache.update(msg)
 
     def on_lidar_pointcloud(msg: PointCloud2_) -> None:
         pointcloud_cache.update(msg)
+
+    low_state_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
+    low_state_subscriber.Init(on_low_state, 10)
 
     odom_subscriber = ChannelSubscriber(args.odom_dds_topic, PoseStamped_)
     odom_subscriber.Init(on_odom, 10)
@@ -370,6 +513,8 @@ async def stream_camera(args: argparse.Namespace) -> None:
     print(f"[SDK] interface={args.sdk_interface}")
     print(f"[WS ] listening on ws://{bind_host}:{args.port}")
     print(f"[WS ] image topic={args.topic}")
+    print(f"[WS ] imu topic={args.imu_topic}")
+    print(f"[WS ] motor topic={args.motor_topic}")
     print(f"[DDS] odom topic={args.odom_dds_topic}")
     print(f"[WS ] odom topic={args.odom_topic}")
     print(f"[DDS] lidar source={args.lidar_source}")
@@ -386,6 +531,26 @@ async def stream_camera(args: argparse.Namespace) -> None:
                 "schemaName": "foxglove.CompressedImage",
                 "schemaEncoding": "jsonschema",
                 "schema": json.dumps(COMPRESSED_IMAGE_SCHEMA),
+            }
+        )
+
+        imu_channel_id = await server.add_channel(
+            {
+                "topic": args.imu_topic,
+                "encoding": "json",
+                "schemaName": "go2.IMUState",
+                "schemaEncoding": "jsonschema",
+                "schema": json.dumps(IMU_SCHEMA),
+            }
+        )
+
+        motor_channel_id = await server.add_channel(
+            {
+                "topic": args.motor_topic,
+                "encoding": "json",
+                "schemaName": "go2.MotorStates",
+                "schemaEncoding": "jsonschema",
+                "schema": json.dumps(MOTOR_STATES_SCHEMA),
             }
         )
 
@@ -411,6 +576,7 @@ async def stream_camera(args: argparse.Namespace) -> None:
 
         await asyncio.gather(
             stream_camera_loop(args, server, image_channel_id, client),
+            stream_state_loop(args, server, imu_channel_id, motor_channel_id, low_state_cache),
             stream_odom_loop(args, server, odom_channel_id, odom_cache),
             stream_lidar_loop(args, server, lidar_channel_id, pointcloud_cache),
         )
